@@ -22,6 +22,17 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from pipecat.bus import BusCancelWorkerMessage, BusEndWorkerMessage, WorkerBus
 from pipecat.bus.bridge_processor import _BusEdgeProcessor
+from pipecat.bus.messages import BusMessage
+from pipecat.bus.ui_messages import (
+    _UI_CANCEL_TASK_BUS_EVENT_NAME,
+    _UI_SNAPSHOT_BUS_EVENT_NAME,
+    BusUICommandMessage,
+    BusUIEventMessage,
+    BusUITaskCompletedMessage,
+    BusUITaskGroupCompletedMessage,
+    BusUITaskGroupStartedMessage,
+    BusUITaskUpdateMessage,
+)
 from pipecat.clocks.base_clock import BaseClock
 from pipecat.clocks.system_clock import SystemClock
 from pipecat.frames.frames import (
@@ -52,6 +63,16 @@ from pipecat.pipeline.utils import run_setup_hook
 from pipecat.pipeline.worker_observer import WorkerObserver
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
 from pipecat.processors.frameworks.rtvi import RTVIObserver, RTVIObserverParams, RTVIProcessor
+from pipecat.processors.frameworks.rtvi.frames import RTVIUICommandFrame, RTVIUITaskFrame
+from pipecat.processors.frameworks.rtvi.models import (
+    UICancelTaskMessage,
+    UIEventMessage,
+    UISnapshotMessage,
+    UITaskCompletedData,
+    UITaskGroupCompletedData,
+    UITaskGroupStartedData,
+    UITaskUpdateData,
+)
 from pipecat.utils.asyncio.task_manager import BaseTaskManager, TaskManager, TaskManagerParams
 from pipecat.utils.tracing.setup import is_tracing_available
 from pipecat.utils.tracing.tracing_context import TracingContext
@@ -376,6 +397,34 @@ class PipelineWorker(BaseWorker):
             @self.rtvi.event_handler("on_client_ready")
             async def on_client_ready(rtvi: RTVIProcessor):
                 await rtvi.set_bot_ready()
+
+            # Republish typed RTVI UI messages from the client onto the bus
+            # as a single BusUIEventMessage carrier so UIWorker subscribers
+            # can dispatch them.
+            @self.rtvi.event_handler("on_ui_message")
+            async def on_ui_message(rtvi: RTVIProcessor, message):
+                if isinstance(message, UIEventMessage):
+                    event_name = message.data.event
+                    payload = message.data.payload
+                elif isinstance(message, UISnapshotMessage):
+                    event_name = _UI_SNAPSHOT_BUS_EVENT_NAME
+                    payload = message.data.tree.model_dump(exclude_none=True)
+                elif isinstance(message, UICancelTaskMessage):
+                    event_name = _UI_CANCEL_TASK_BUS_EVENT_NAME
+                    payload = {
+                        "task_id": message.data.task_id,
+                        "reason": message.data.reason,
+                    }
+                else:
+                    return
+                await self.send_bus_message(
+                    BusUIEventMessage(
+                        source=self.name,
+                        target=None,
+                        event_name=event_name,
+                        payload=payload,
+                    )
+                )
 
         # This is the idle event. When selected frames are pushed from any
         # processor we consider the pipeline is not idle. We use an observer
@@ -703,6 +752,68 @@ class PipelineWorker(BaseWorker):
         elif isinstance(frames, Iterable):
             for frame in frames:
                 await self.queue_frame(frame, direction)
+
+    async def on_bus_message(self, message: BusMessage) -> None:
+        """Handle bus messages for outbound RTVI UI messages.
+
+        Runs the base lifecycle/job dispatch first, then translates RTVI
+        UI bus messages produced by a ``UIWorker`` (``BusUICommandMessage``
+        and the four ``BusUITask*`` lifecycle carriers) into the matching
+        RTVI frames and queues them downstream, where the ``RTVIObserver``
+        wraps them into typed ``ui-command`` / ``ui-task`` envelopes for the
+        client. Only the worker that owns the RTVI processor performs this
+        translation; other workers skip it.
+        """
+        await super().on_bus_message(message)
+
+        if self._rtvi is None:
+            return
+
+        frame: Frame | None = None
+        if isinstance(message, BusUICommandMessage):
+            frame = RTVIUICommandFrame(
+                command=message.command_name,
+                payload=message.payload,
+            )
+        elif isinstance(message, BusUITaskGroupStartedMessage):
+            frame = RTVIUITaskFrame(
+                data=UITaskGroupStartedData(
+                    task_id=message.task_id,
+                    agents=list(message.agents or []),
+                    label=message.label,
+                    cancellable=message.cancellable,
+                    at=message.at,
+                )
+            )
+        elif isinstance(message, BusUITaskUpdateMessage):
+            frame = RTVIUITaskFrame(
+                data=UITaskUpdateData(
+                    task_id=message.task_id,
+                    agent_name=message.agent_name,
+                    data=message.data,
+                    at=message.at,
+                )
+            )
+        elif isinstance(message, BusUITaskCompletedMessage):
+            frame = RTVIUITaskFrame(
+                data=UITaskCompletedData(
+                    task_id=message.task_id,
+                    agent_name=message.agent_name,
+                    status=message.status,
+                    response=message.response,
+                    at=message.at,
+                )
+            )
+        elif isinstance(message, BusUITaskGroupCompletedMessage):
+            frame = RTVIUITaskFrame(
+                data=UITaskGroupCompletedData(
+                    task_id=message.task_id,
+                    at=message.at,
+                )
+            )
+
+        if frame is not None:
+            await self.queue_frame(frame)
 
     async def _cancel(self, *, reason: str | None = None):
         """Internal cancellation logic for the pipeline worker.
